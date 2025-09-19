@@ -170,16 +170,18 @@ func triggerDisbursements(c *gin.Context) {
 	stats.EventsWithAmount = len(processedEvents)
 	log.Printf("Found %d events with amount owed > 0, total amount: $%.2f", len(processedEvents), stats.TotalAmountOwed)
 
-	// Process each event
-	for _, event := range processedEvents {
-		err := processDisbursement(event)
-		if err != nil {
-			log.Printf("Error processing disbursement for event %s: %v", event.ID, err)
-			stats.FailedCount++
-		} else {
-			stats.ProcessedCount++
+	// Process each event including negative amounts
+	for _, event := range events {
+		if event.Fields.AmountOwed != 0 { // Process both positive and negative amounts
+			err := processDisbursement(event)
+			if err != nil {
+				log.Printf("Error processing disbursement for event %s: %v", event.ID, err)
+				stats.FailedCount++
+			} else {
+				stats.ProcessedCount++
+			}
+			stats.DisbursementsCreated++
 		}
-		stats.DisbursementsCreated++
 	}
 
 	log.Printf("Disbursement process completed. Created: %d, Processed: %d, Failed: %d", 
@@ -278,8 +280,14 @@ func processDisbursement(event AirtableEvent) error {
 	}
 
 	// Update disbursement as processed
-	notes := fmt.Sprintf("Successfully processed HCB transfer. Sent $%.2f to organization %s. Completed at %s", 
-		event.Fields.AmountOwed, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
+	var notes string
+	if event.Fields.AmountOwed < 0 {
+		notes = fmt.Sprintf("Successfully processed HCB withdrawal. Received $%.2f from organization %s. Completed at %s", 
+			-event.Fields.AmountOwed, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
+	} else {
+		notes = fmt.Sprintf("Successfully processed HCB transfer. Sent $%.2f to organization %s. Completed at %s", 
+			event.Fields.AmountOwed, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
+	}
 	err = updateDisbursementStatus(disbursement.ID, "processed", notes)
 	if err != nil {
 		log.Printf("Failed to update disbursement status: %v", err)
@@ -294,6 +302,11 @@ func createDisbursement(event AirtableEvent) (*AirtableDisbursementResponse, err
 	baseID := os.Getenv("AIRTABLE_BASE_ID")
 	apiKey := os.Getenv("AIRTABLE_API_KEY")
 
+	disbursementType := "autogrant"
+	if event.Fields.AmountOwed < 0 {
+		disbursementType = "withdrawal"
+	}
+
 	disbursement := AirtableDisbursement{
 		Fields: struct {
 			AssociatedEvent   []string `json:"associated_event"`
@@ -305,7 +318,7 @@ func createDisbursement(event AirtableEvent) (*AirtableDisbursementResponse, err
 			AssociatedEvent:  []string{event.ID},
 			Amount:           event.Fields.AmountOwed,
 			Status:           "pending",
-			DisbursementType: "autogrant",
+			DisbursementType: disbursementType,
 			Notes:            fmt.Sprintf("Created for event %s at %s", event.ID, time.Now().Format("2006-01-02 15:04:05 MST")),
 		},
 	}
@@ -352,10 +365,25 @@ func createDisbursement(event AirtableEvent) (*AirtableDisbursementResponse, err
 func sendHCBTransfer(event AirtableEvent, disbursementID int) error {
 	token := os.Getenv("HCB_API_TOKEN")
 
-	transfer := HCBTransferRequest{
-		ToOrganizationID: event.Fields.HCBEventID,
-		Name:             fmt.Sprintf("Daydream signup grant %d", disbursementID),
-		AmountCents:      int(event.Fields.AmountOwed * 100), // Convert to cents
+	var transfer HCBTransferRequest
+	var url string
+
+	if event.Fields.AmountOwed < 0 {
+		// Negative amount - withdrawal from event to daydream
+		transfer = HCBTransferRequest{
+			ToOrganizationID: "daydream",
+			Name:             fmt.Sprintf("Daydream signup withdrawal %d", disbursementID),
+			AmountCents:      int(-event.Fields.AmountOwed * 100), // Make positive for transfer amount
+		}
+		url = fmt.Sprintf("https://hcb.hackclub.com/api/v4/organizations/%s/transfers/", event.Fields.HCBEventID)
+	} else {
+		// Positive amount - grant from daydream to event
+		transfer = HCBTransferRequest{
+			ToOrganizationID: event.Fields.HCBEventID,
+			Name:             fmt.Sprintf("Daydream signup grant %d", disbursementID),
+			AmountCents:      int(event.Fields.AmountOwed * 100), // Convert to cents
+		}
+		url = "https://hcb.hackclub.com/api/v4/organizations/daydream/transfers/"
 	}
 
 	jsonData, err := json.Marshal(transfer)
@@ -363,7 +391,7 @@ func sendHCBTransfer(event AirtableEvent, disbursementID int) error {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", "https://hcb.hackclub.com/api/v4/organizations/daydream/transfers/", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
