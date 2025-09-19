@@ -111,6 +111,20 @@ func main() {
     <form method="post" action="/trigger-disbursements">
         <button type="submit" class="button">Trigger Disbursements</button>
     </form>
+    
+    <div style="border-top: 1px solid #ccc; margin-top: 30px; padding-top: 30px;">
+        <h3>Custom Miscellaneous Disbursements</h3>
+        <p>Disburse a custom amount to all events in the view. This will create 'miscellaneous' type disbursements.</p>
+        <form method="post" action="/trigger-custom-disbursements">
+            <label for="custom_amount" style="display: block; margin-bottom: 10px;">
+                <strong>Amount per Event ($):</strong>
+            </label>
+            <input type="number" id="custom_amount" name="custom_amount" step="0.01" required 
+                   style="padding: 10px; margin-bottom: 20px; width: 200px; border: 1px solid #ccc;">
+            <br>
+            <button type="submit" class="button" style="background: #d9534f;">Trigger Custom Disbursements</button>
+        </form>
+    </div>
 </body>
 </html>`
 		lastRun := "Never"
@@ -132,6 +146,7 @@ func main() {
 	})
 
 	authorized.POST("/trigger-disbursements", triggerDisbursements)
+	authorized.POST("/trigger-custom-disbursements", triggerCustomDisbursements)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -187,6 +202,51 @@ func triggerDisbursements(c *gin.Context) {
 	log.Printf("Disbursement process completed. Created: %d, Processed: %d, Failed: %d", 
 		stats.DisbursementsCreated, stats.ProcessedCount, stats.FailedCount)
 
+	c.Redirect(302, "/")
+}
+
+func triggerCustomDisbursements(c *gin.Context) {
+	log.Println("Starting custom disbursement process...")
+	
+	customAmountStr := c.PostForm("custom_amount")
+	if customAmountStr == "" {
+		c.String(400, "Custom amount is required")
+		return
+	}
+	
+	var customAmount float64
+	_, err := fmt.Sscanf(customAmountStr, "%f", &customAmount)
+	if err != nil {
+		c.String(400, "Invalid amount format: %v", err)
+		return
+	}
+	
+	// Get all events from Airtable
+	events, err := getAllEvents()
+	if err != nil {
+		log.Printf("Error fetching events: %v", err)
+		c.String(500, "Error fetching events: %v", err)
+		return
+	}
+	
+	log.Printf("Found %d events for custom disbursement of $%.2f each", len(events), customAmount)
+	
+	processedCount := 0
+	failedCount := 0
+	
+	// Process each event with custom amount
+	for _, event := range events {
+		err := processCustomDisbursement(event, customAmount)
+		if err != nil {
+			log.Printf("Error processing custom disbursement for event %s: %v", event.ID, err)
+			failedCount++
+		} else {
+			processedCount++
+		}
+	}
+	
+	log.Printf("Custom disbursement process completed. Processed: %d, Failed: %d", processedCount, failedCount)
+	
 	c.Redirect(302, "/")
 }
 
@@ -460,5 +520,145 @@ func updateDisbursementStatus(disbursementID, status, notes string) error {
 		return fmt.Errorf("airtable API error updating disbursement: %s", string(body))
 	}
 
+	return nil
+}
+
+func processCustomDisbursement(event AirtableEvent, customAmount float64) error {
+	log.Printf("Processing custom disbursement for event %s (HCB ID: %s, Custom Amount: $%.2f)", 
+		event.ID, event.Fields.HCBEventID, customAmount)
+
+	// Create disbursement in Airtable with custom amount
+	disbursement, err := createCustomDisbursement(event, customAmount)
+	if err != nil {
+		return fmt.Errorf("failed to create custom disbursement: %v", err)
+	}
+
+	log.Printf("Created custom disbursement %d for event %s", 
+		disbursement.Fields.DisbursementID, event.ID)
+
+	// Send to HCB with custom amount
+	err = sendCustomHCBTransfer(event, disbursement.Fields.DisbursementID, customAmount)
+	if err != nil {
+		// Update disbursement as failed
+		notes := fmt.Sprintf("HCB custom transfer failed: %v. Created at %s", err, time.Now().Format("2006-01-02 15:04:05 MST"))
+		updateErr := updateDisbursementStatus(disbursement.ID, "failed", notes)
+		if updateErr != nil {
+			log.Printf("Failed to update disbursement status: %v", updateErr)
+		}
+		return fmt.Errorf("HCB custom transfer failed: %v", err)
+	}
+
+	// Update disbursement as processed
+	notes := fmt.Sprintf("Successfully processed custom HCB transfer. Sent $%.2f to organization %s. Completed at %s", 
+		customAmount, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
+	err = updateDisbursementStatus(disbursement.ID, "processed", notes)
+	if err != nil {
+		log.Printf("Failed to update disbursement status: %v", err)
+		return err
+	}
+
+	log.Printf("Successfully completed custom disbursement %d", disbursement.Fields.DisbursementID)
+	return nil
+}
+
+func createCustomDisbursement(event AirtableEvent, customAmount float64) (*AirtableDisbursementResponse, error) {
+	baseID := os.Getenv("AIRTABLE_BASE_ID")
+	apiKey := os.Getenv("AIRTABLE_API_KEY")
+
+	disbursement := AirtableDisbursement{
+		Fields: struct {
+			AssociatedEvent   []string `json:"associated_event"`
+			Amount            float64  `json:"amount"`
+			Status            string   `json:"status"`
+			DisbursementType  string   `json:"disbursement_type"`
+			Notes             string   `json:"notes"`
+		}{
+			AssociatedEvent:  []string{event.ID},
+			Amount:           customAmount,
+			Status:           "pending",
+			DisbursementType: "miscellaneous",
+			Notes:            fmt.Sprintf("Custom disbursement created for event %s at %s", event.ID, time.Now().Format("2006-01-02 15:04:05 MST")),
+		},
+	}
+
+	jsonData, err := json.Marshal(disbursement)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("https://api.airtable.com/v0/%s/disbursements", baseID)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("airtable API error: %s", string(body))
+	}
+
+	var response AirtableDisbursementResponse
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return nil, err
+	}
+
+	return &response, nil
+}
+
+func sendCustomHCBTransfer(event AirtableEvent, disbursementID int, customAmount float64) error {
+	token := os.Getenv("HCB_API_TOKEN")
+
+	transfer := HCBTransferRequest{
+		ToOrganizationID: event.Fields.HCBEventID,
+		Name:             fmt.Sprintf("Daydream miscellaneous disbursement %d", disbursementID),
+		AmountCents:      int(customAmount * 100), // Convert to cents
+	}
+	url := "https://hcb.hackclub.com/api/v4/organizations/daydream/transfers/"
+
+	jsonData, err := json.Marshal(transfer)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HCB API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("HCB custom transfer successful: %s", string(body))
 	return nil
 }
