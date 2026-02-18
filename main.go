@@ -10,6 +10,8 @@ import (
 	"os"
 	"time"
 
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -68,6 +70,266 @@ type DisbursementStats struct {
 
 var stats DisbursementStats
 
+const dashboardHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>Campfire Cash Cannon</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #1a1a2e; min-height: 100vh; }
+        .container { max-width: 860px; margin: 0 auto; padding: 32px 20px; }
+        h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+        .subtitle { color: #666; font-size: 14px; margin-bottom: 28px; }
+        .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        .card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #333; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; }
+        .stat { text-align: center; }
+        .stat .value { font-size: 28px; font-weight: 700; color: #007cba; }
+        .stat .label { font-size: 12px; color: #888; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat.success .value { color: #2e7d32; }
+        .stat.danger .value { color: #c62828; }
+        .actions { display: flex; gap: 12px; flex-wrap: wrap; }
+        .btn { padding: 12px 24px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; gap: 8px; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background: #007cba; color: #fff; }
+        .btn-primary:hover:not(:disabled) { background: #005f8f; }
+        .btn-danger { background: #c62828; color: #fff; }
+        .btn-danger:hover:not(:disabled) { background: #a51d1d; }
+        .btn-ghost { background: #e8e8e8; color: #333; }
+        .btn-ghost:hover:not(:disabled) { background: #d0d0d0; }
+        .custom-input { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+        .custom-input label { font-weight: 600; font-size: 14px; white-space: nowrap; }
+        .custom-input input { padding: 10px 14px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 15px; width: 160px; }
+        .custom-input input:focus { outline: none; border-color: #007cba; }
+        .divider { border-top: 1px solid #eee; margin: 20px 0; }
+
+        /* Modal overlay */
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 100; justify-content: center; align-items: center; }
+        .modal-overlay.active { display: flex; }
+        .modal { background: #fff; border-radius: 14px; width: 90vw; max-width: 680px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.25); }
+        .modal-header { padding: 20px 24px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h2 { font-size: 18px; margin: 0; }
+        .modal-close { background: none; border: none; font-size: 22px; cursor: pointer; color: #888; padding: 4px 8px; border-radius: 6px; }
+        .modal-close:hover { background: #f0f0f0; }
+        .modal-body { padding: 20px 24px; overflow-y: auto; flex: 1; }
+        .modal-footer { padding: 16px 24px; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 10px; }
+
+        /* Preview summary */
+        .preview-summary { background: #f8f9fa; border-radius: 10px; padding: 16px 20px; margin-bottom: 16px; display: flex; gap: 32px; flex-wrap: wrap; }
+        .preview-summary .item { }
+        .preview-summary .item .num { font-size: 22px; font-weight: 700; }
+        .preview-summary .item .lbl { font-size: 12px; color: #666; }
+        .preview-summary .item.total .num { color: #007cba; }
+        .preview-summary .item.warn .num { color: #c62828; }
+
+        /* Event table */
+        .event-table { width: 100%%; border-collapse: collapse; font-size: 13px; }
+        .event-table th { text-align: left; padding: 8px 12px; background: #f4f4f4; font-weight: 600; color: #555; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .event-table td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; }
+        .event-table tr:last-child td { border-bottom: none; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+        .badge-grant { background: #e8f5e9; color: #2e7d32; }
+        .badge-withdrawal { background: #fce4ec; color: #c62828; }
+        .amount-positive { color: #2e7d32; font-weight: 600; }
+        .amount-negative { color: #c62828; font-weight: 600; }
+
+        /* Spinner */
+        .spinner { display: inline-block; width: 18px; height: 18px; border: 2.5px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%%; animation: spin 0.6s linear infinite; }
+        .spinner.dark { border-color: rgba(0,0,0,0.1); border-top-color: #007cba; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Result banner */
+        .result-banner { padding: 16px 20px; border-radius: 10px; margin-bottom: 20px; display: none; }
+        .result-banner.success { background: #e8f5e9; color: #1b5e20; display: block; }
+        .result-banner.error { background: #fce4ec; color: #b71c1c; display: block; }
+        .result-banner h3 { font-size: 15px; margin-bottom: 4px; }
+        .result-banner p { font-size: 13px; margin: 2px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💸 Cash Cannon</h1>
+        <p class="subtitle">Campfire disbursement dashboard</p>
+
+        <div id="resultBanner" class="result-banner"></div>
+
+        <div class="card">
+            <h2>Last Run Statistics</h2>
+            <div class="stats-grid">
+                <div class="stat"><div class="value">%d</div><div class="label">Total Events</div></div>
+                <div class="stat"><div class="value">%d</div><div class="label">With Amount</div></div>
+                <div class="stat"><div class="value">$%.2f</div><div class="label">Total Owed</div></div>
+                <div class="stat"><div class="value">%d</div><div class="label">Disbursements</div></div>
+                <div class="stat success"><div class="value">%d</div><div class="label">Processed</div></div>
+                <div class="stat danger"><div class="value">%d</div><div class="label">Failed</div></div>
+            </div>
+            <p style="font-size:12px;color:#999;margin-top:12px;">Last run: %s</p>
+        </div>
+
+        <div class="card">
+            <h2>Autogrant Disbursements</h2>
+            <p style="font-size:13px;color:#666;margin-bottom:16px;">Disburse the <code>amount_owed</code> to each event. Only events with a non-zero balance will be processed.</p>
+            <div class="actions">
+                <button class="btn btn-primary" onclick="previewDisbursements('autogrant')">
+                    Preview &amp; Disburse
+                </button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Custom Miscellaneous Disbursements</h2>
+            <p style="font-size:13px;color:#666;margin-bottom:16px;">Send a fixed dollar amount to every event in the view.</p>
+            <div class="custom-input">
+                <label for="customAmount">Amount per event ($)</label>
+                <input type="number" id="customAmount" step="0.01" min="0.01" placeholder="0.00">
+            </div>
+            <div class="actions">
+                <button class="btn btn-danger" onclick="previewDisbursements('custom')">
+                    Preview &amp; Disburse
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div class="modal-overlay" id="confirmModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 id="modalTitle">Confirm Disbursements</h2>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <div style="text-align:center;padding:40px;"><div class="spinner dark"></div><p style="margin-top:12px;color:#888;font-size:13px;">Loading preview…</p></div>
+            </div>
+            <div class="modal-footer" id="modalFooter" style="display:none;">
+                <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-danger" id="confirmBtn" onclick="executeDisbursements()">
+                    Confirm &amp; Send Money
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    let currentMode = '';
+    let currentCustomAmount = 0;
+
+    function previewDisbursements(mode) {
+        currentMode = mode;
+        document.getElementById('confirmModal').classList.add('active');
+        document.getElementById('modalFooter').style.display = 'none';
+        document.getElementById('modalBody').innerHTML = '<div style="text-align:center;padding:40px;"><div class="spinner dark"></div><p style="margin-top:12px;color:#888;font-size:13px;">Fetching events from Airtable…</p></div>';
+
+        let url = '/api/preview';
+        if (mode === 'custom') {
+            const amt = document.getElementById('customAmount').value;
+            if (!amt || parseFloat(amt) <= 0) {
+                document.getElementById('modalBody').innerHTML = '<p style="color:#c62828;padding:20px;">Please enter a valid amount greater than zero.</p>';
+                return;
+            }
+            currentCustomAmount = parseFloat(amt);
+            url += '?custom_amount=' + encodeURIComponent(amt);
+            document.getElementById('modalTitle').textContent = 'Confirm Custom Disbursements';
+        } else {
+            document.getElementById('modalTitle').textContent = 'Confirm Autogrant Disbursements';
+        }
+
+        fetch(url)
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) { throw new Error(data.error); }
+                renderPreview(data);
+            })
+            .catch(err => {
+                document.getElementById('modalBody').innerHTML = '<p style="color:#c62828;padding:20px;">Error: ' + err.message + '</p>';
+            });
+    }
+
+    function renderPreview(data) {
+        if (data.event_count === 0) {
+            document.getElementById('modalBody').innerHTML = '<p style="padding:20px;color:#666;">No events to process. All balances are zero.</p>';
+            return;
+        }
+
+        const totalAbs = data.events.reduce((s, e) => s + Math.abs(e.amount), 0);
+        const grants = data.events.filter(e => e.direction === 'grant');
+        const withdrawals = data.events.filter(e => e.direction === 'withdrawal');
+
+        let html = '<div class="preview-summary">';
+        html += '<div class="item"><div class="num">' + data.event_count + '</div><div class="lbl">Events</div></div>';
+        html += '<div class="item total"><div class="num">$' + totalAbs.toFixed(2) + '</div><div class="lbl">Total Amount</div></div>';
+        if (grants.length) html += '<div class="item"><div class="num">' + grants.length + '</div><div class="lbl">Grants</div></div>';
+        if (withdrawals.length) html += '<div class="item warn"><div class="num">' + withdrawals.length + '</div><div class="lbl">Withdrawals</div></div>';
+        html += '</div>';
+
+        html += '<table class="event-table"><thead><tr><th>HCB Event ID</th><th>Amount</th><th>Type</th></tr></thead><tbody>';
+        data.events.forEach(e => {
+            const amtClass = e.amount >= 0 ? 'amount-positive' : 'amount-negative';
+            const badge = e.direction === 'grant'
+                ? '<span class="badge badge-grant">Grant</span>'
+                : '<span class="badge badge-withdrawal">Withdrawal</span>';
+            html += '<tr><td>' + e.hcb_event_id + '</td><td class="' + amtClass + '">$' + Math.abs(e.amount).toFixed(2) + '</td><td>' + badge + '</td></tr>';
+        });
+        html += '</tbody></table>';
+
+        document.getElementById('modalBody').innerHTML = html;
+        document.getElementById('modalFooter').style.display = 'flex';
+    }
+
+    function executeDisbursements() {
+        const btn = document.getElementById('confirmBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Processing…';
+
+        let url, body;
+        if (currentMode === 'custom') {
+            url = '/trigger-custom-disbursements';
+            body = 'custom_amount=' + encodeURIComponent(currentCustomAmount);
+        } else {
+            url = '/trigger-disbursements';
+            body = '';
+        }
+
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body
+        })
+        .then(r => r.json())
+        .then(result => {
+            closeModal();
+            showResult(result);
+        })
+        .catch(err => {
+            closeModal();
+            showResult({ error: err.message });
+        });
+    }
+
+    function showResult(result) {
+        const banner = document.getElementById('resultBanner');
+        if (result.error) {
+            banner.className = 'result-banner error';
+            banner.innerHTML = '<h3>Disbursement Failed</h3><p>' + result.error + '</p>';
+        } else {
+            banner.className = 'result-banner success';
+            banner.innerHTML = '<h3>Disbursements Complete</h3>'
+                + '<p>Created: ' + result.created + ' · Processed: ' + result.processed + ' · Failed: ' + result.failed + '</p>';
+        }
+        setTimeout(() => { location.reload(); }, 3000);
+    }
+
+    function closeModal() {
+        document.getElementById('confirmModal').classList.remove('active');
+        const btn = document.getElementById('confirmBtn');
+        btn.disabled = false;
+        btn.innerHTML = 'Confirm &amp; Send Money';
+    }
+    </script>
+</body>
+</html>`
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -81,70 +343,8 @@ func main() {
 		os.Getenv("BASIC_AUTH_USERNAME"): os.Getenv("BASIC_AUTH_PASSWORD"),
 	}))
 
-	// Serve HTML template
-	authorized.GET("/", func(c *gin.Context) {
-		html := `<!DOCTYPE html>
-<html>
-<head>
-    <title>Daydream Cash Cannon</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        .stats { background: #f5f5f5; padding: 20px; margin: 20px 0; }
-        .button { background: #007cba; color: white; padding: 15px 30px; border: none; cursor: pointer; font-size: 16px; margin: 10px 0; }
-        .button:hover { background: #005a8b; }
-        .success { color: green; }
-        .error { color: red; }
-    </style>
-</head>
-<body>
-    <h1>Daydream Cash Cannon</h1>
-    <div class="stats">
-        <h3>Statistics</h3>
-        <p>Total Events: <strong>%d</strong></p>
-        <p>Events with Amount Owed: <strong>%d</strong></p>
-        <p>Total Amount Owed: <strong>$%.2f</strong></p>
-        <p>Disbursements Created: <strong>%d</strong></p>
-        <p>Processed: <strong>%d</strong></p>
-        <p>Failed: <strong>%d</strong></p>
-        <p>Last Run: <strong>%s</strong></p>
-    </div>
-    <form method="post" action="/trigger-disbursements">
-        <button type="submit" class="button">Trigger Disbursements</button>
-    </form>
-    
-    <div style="border-top: 1px solid #ccc; margin-top: 30px; padding-top: 30px;">
-        <h3>Custom Miscellaneous Disbursements</h3>
-        <p>Disburse a custom amount to all events in the view. This will create 'miscellaneous' type disbursements.</p>
-        <form method="post" action="/trigger-custom-disbursements">
-            <label for="custom_amount" style="display: block; margin-bottom: 10px;">
-                <strong>Amount per Event ($):</strong>
-            </label>
-            <input type="number" id="custom_amount" name="custom_amount" step="0.01" required 
-                   style="padding: 10px; margin-bottom: 20px; width: 200px; border: 1px solid #ccc;">
-            <br>
-            <button type="submit" class="button" style="background: #d9534f;">Trigger Custom Disbursements</button>
-        </form>
-    </div>
-</body>
-</html>`
-		lastRun := "Never"
-		if !stats.LastRun.IsZero() {
-			lastRun = stats.LastRun.Format("2006-01-02 15:04:05 MST")
-		}
-		
-		formattedHTML := fmt.Sprintf(html, 
-			stats.TotalEvents, 
-			stats.EventsWithAmount, 
-			stats.TotalAmountOwed,
-			stats.DisbursementsCreated,
-			stats.ProcessedCount,
-			stats.FailedCount,
-			lastRun)
-		
-		c.Header("Content-Type", "text/html")
-		c.String(200, formattedHTML)
-	})
-
+	authorized.GET("/", serveDashboard)
+	authorized.GET("/api/preview", handlePreview)
 	authorized.POST("/trigger-disbursements", triggerDisbursements)
 	authorized.POST("/trigger-custom-disbursements", triggerCustomDisbursements)
 
@@ -155,6 +355,85 @@ func main() {
 
 	log.Printf("Starting server on port %s", port)
 	r.Run(":" + port)
+}
+
+func serveDashboard(c *gin.Context) {
+	lastRun := "Never"
+	if !stats.LastRun.IsZero() {
+		lastRun = stats.LastRun.Format("2006-01-02 15:04:05 MST")
+	}
+
+	html := fmt.Sprintf(dashboardHTML,
+		stats.TotalEvents,
+		stats.EventsWithAmount,
+		stats.TotalAmountOwed,
+		stats.DisbursementsCreated,
+		stats.ProcessedCount,
+		stats.FailedCount,
+		lastRun)
+
+	c.Header("Content-Type", "text/html")
+	c.String(200, html)
+}
+
+func handlePreview(c *gin.Context) {
+	customAmountStr := c.Query("custom_amount")
+
+	events, err := getAllEvents()
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("Failed to fetch events: %v", err)})
+		return
+	}
+
+	type EventPreview struct {
+		RecordID   string  `json:"record_id"`
+		HCBEventID string  `json:"hcb_event_id"`
+		Amount     float64 `json:"amount"`
+		Direction  string  `json:"direction"`
+	}
+
+	var previews []EventPreview
+	totalAmount := 0.0
+
+	if customAmountStr != "" {
+		customAmount, err := strconv.ParseFloat(customAmountStr, 64)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid custom amount"})
+			return
+		}
+		for _, event := range events {
+			previews = append(previews, EventPreview{
+				RecordID:   event.ID,
+				HCBEventID: event.Fields.HCBEventID,
+				Amount:     customAmount,
+				Direction:  "grant",
+			})
+			totalAmount += customAmount
+		}
+	} else {
+		for _, event := range events {
+			if event.Fields.AmountOwed != 0 {
+				direction := "grant"
+				if event.Fields.AmountOwed < 0 {
+					direction = "withdrawal"
+				}
+				previews = append(previews, EventPreview{
+					RecordID:   event.ID,
+					HCBEventID: event.Fields.HCBEventID,
+					Amount:     event.Fields.AmountOwed,
+					Direction:  direction,
+				})
+				totalAmount += event.Fields.AmountOwed
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"events":       previews,
+		"total_events": len(events),
+		"total_amount": totalAmount,
+		"event_count":  len(previews),
+	})
 }
 
 func triggerDisbursements(c *gin.Context) {
@@ -202,7 +481,11 @@ func triggerDisbursements(c *gin.Context) {
 	log.Printf("Disbursement process completed. Created: %d, Processed: %d, Failed: %d", 
 		stats.DisbursementsCreated, stats.ProcessedCount, stats.FailedCount)
 
-	c.Redirect(302, "/")
+	c.JSON(200, gin.H{
+		"created":   stats.DisbursementsCreated,
+		"processed": stats.ProcessedCount,
+		"failed":    stats.FailedCount,
+	})
 }
 
 func triggerCustomDisbursements(c *gin.Context) {
@@ -246,8 +529,12 @@ func triggerCustomDisbursements(c *gin.Context) {
 	}
 	
 	log.Printf("Custom disbursement process completed. Processed: %d, Failed: %d", processedCount, failedCount)
-	
-	c.Redirect(302, "/")
+
+	c.JSON(200, gin.H{
+		"created":   processedCount + failedCount,
+		"processed": processedCount,
+		"failed":    failedCount,
+	})
 }
 
 func getAllEvents() ([]AirtableEvent, error) {
@@ -274,7 +561,7 @@ func getAllEvents() ([]AirtableEvent, error) {
 func getEventsPage(offset string) ([]AirtableEvent, string, error) {
 	baseID := os.Getenv("AIRTABLE_BASE_ID")
 	apiKey := os.Getenv("AIRTABLE_API_KEY")
-	viewID := "viwd1z4JsMUf15DNb"
+	viewID := "viwjvoyfA2Cgc4XE4"
 
 	url := fmt.Sprintf("https://api.airtable.com/v0/%s/events?view=%s", baseID, viewID)
 	if offset != "" {
@@ -429,21 +716,21 @@ func sendHCBTransfer(event AirtableEvent, disbursementID int) error {
 	var url string
 
 	if event.Fields.AmountOwed < 0 {
-		// Negative amount - withdrawal from event to daydream
+		// Negative amount - withdrawal from event to Campfire
 		transfer = HCBTransferRequest{
-			ToOrganizationID: "daydream",
-			Name:             fmt.Sprintf("Daydream signup withdrawal %d", disbursementID),
+			ToOrganizationID: "campfire",
+			Name:             fmt.Sprintf("Campfire signup withdrawal ID %d", disbursementID),
 			AmountCents:      int(-event.Fields.AmountOwed * 100), // Make positive for transfer amount
 		}
 		url = fmt.Sprintf("https://hcb.hackclub.com/api/v4/organizations/%s/transfers/", event.Fields.HCBEventID)
 	} else {
-		// Positive amount - grant from daydream to event
+		// Positive amount - grant from Campfire to event
 		transfer = HCBTransferRequest{
 			ToOrganizationID: event.Fields.HCBEventID,
-			Name:             fmt.Sprintf("Daydream signup grant %d", disbursementID),
+			Name:             fmt.Sprintf("Campfire signup grant ID %d", disbursementID),
 			AmountCents:      int(event.Fields.AmountOwed * 100), // Convert to cents
 		}
-		url = "https://hcb.hackclub.com/api/v4/organizations/daydream/transfers/"
+		url = "https://hcb.hackclub.com/api/v4/organizations/campfire/transfers/"
 	}
 
 	jsonData, err := json.Marshal(transfer)
@@ -625,10 +912,10 @@ func sendCustomHCBTransfer(event AirtableEvent, disbursementID int, customAmount
 
 	transfer := HCBTransferRequest{
 		ToOrganizationID: event.Fields.HCBEventID,
-		Name:             fmt.Sprintf("Daydream miscellaneous disbursement %d", disbursementID),
+		Name:             fmt.Sprintf("Campfire miscellaneous disbursement %d", disbursementID),
 		AmountCents:      int(customAmount * 100), // Convert to cents
 	}
-	url := "https://hcb.hackclub.com/api/v4/organizations/daydream/transfers/"
+	url := "https://hcb.hackclub.com/api/v4/organizations/campfire/transfers/"
 
 	jsonData, err := json.Marshal(transfer)
 	if err != nil {
