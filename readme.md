@@ -4,7 +4,7 @@ A reliable service written in go to send money / disbursements to users using th
 
 Airtable schema definition and documentation:
 
-Base: Daydream
+Base: Campfire
 Table: events
 View ID: viwd1z4JsMUf15DNb
 Relevant field names:
