@@ -1,951 +1,695 @@
 package main
 
+// Haven Cash Cannon: sends signup autogrants from the Haven HQ HCB org to each
+// event's HCB org, driven by the "Owed Amount" field in the Haven Airtable base.
+// Adapted from the Campfire cash cannon. Every Airtable field is addressed by
+// field ID so renames in the base cannot break payouts.
+
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
-	"time"
-
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
-type AirtableEvent struct {
-	ID     string `json:"id"`
-	Fields struct {
-		HCBEventID  string  `json:"hcb_event_id"`
-		AmountOwed  float64 `json:"amount_owed"`
-		RecordID    string  `json:"record_id"`
-	} `json:"fields"`
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+type Config struct {
+	AirtableAPIKey     string
+	AirtableBaseID     string
+	EventsTable        string
+	DisbursementsTable string
+	EventsFilter       string // Airtable filterByFormula selecting eligible events
+	HCBToken           string
+	HCBSourceOrg       string // slug or org_ id of the org that pays (Haven HQ)
+	ProgramName        string
+	BasicAuthUser      string
+	BasicAuthPass      string
+	Port               string
 }
 
-type AirtableEventsResponse struct {
-	Records []AirtableEvent `json:"records"`
-	Offset  string          `json:"offset,omitempty"`
+var cfg Config
+
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }
 
-type AirtableDisbursement struct {
-	Fields struct {
-		AssociatedEvent   []string `json:"associated_event"`
-		Amount            float64  `json:"amount"`
-		Status            string   `json:"status"`
-		DisbursementType  string   `json:"disbursement_type"`
-		Notes             string   `json:"notes"`
-	} `json:"fields"`
+func loadConfig() {
+	cfg = Config{
+		AirtableAPIKey:     os.Getenv("AIRTABLE_API_KEY"),
+		AirtableBaseID:     envOr("AIRTABLE_BASE_ID", "appc9YSRmmAmLI37u"),
+		EventsTable:        envOr("AIRTABLE_EVENTS_TABLE", "tbl0BQWphHe0gWEIp"),
+		DisbursementsTable: envOr("AIRTABLE_DISBURSEMENTS_TABLE", "tblnDFHiIEvVPWcqH"),
+		EventsFilter:       envOr("AIRTABLE_EVENTS_FILTER", "AND({Status}='Active', NOT({_Is Test}), {HCB ID}!='')"),
+		HCBToken:           os.Getenv("HCB_API_TOKEN"),
+		HCBSourceOrg:       envOr("HCB_SOURCE_ORG", "ysws-haven"),
+		ProgramName:        envOr("PROGRAM_NAME", "Haven"),
+		BasicAuthUser:      os.Getenv("BASIC_AUTH_USERNAME"),
+		BasicAuthPass:      os.Getenv("BASIC_AUTH_PASSWORD"),
+		Port:               envOr("PORT", "8080"),
+	}
+	var missing []string
+	for k, v := range map[string]string{
+		"AIRTABLE_API_KEY": cfg.AirtableAPIKey, "HCB_API_TOKEN": cfg.HCBToken,
+		"BASIC_AUTH_USERNAME": cfg.BasicAuthUser, "BASIC_AUTH_PASSWORD": cfg.BasicAuthPass,
+	} {
+		if v == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		log.Fatalf("missing required environment variables: %s", strings.Join(missing, ", "))
+	}
 }
 
-type AirtableDisbursementResponse struct {
-	ID     string `json:"id"`
-	Fields struct {
-		DisbursementID   int     `json:"disbursement_id"`
-		AssociatedEvent  []string `json:"associated_event"`
-		Amount           float64  `json:"amount"`
-		Status           string   `json:"status"`
-		DisbursementType string   `json:"disbursement_type"`
-		Notes            string   `json:"notes"`
-	} `json:"fields"`
+// Airtable field IDs (Haven base appc9YSRmmAmLI37u).
+const (
+	// Events table
+	fEvName      = "fldedrTuI1qpSYRE5" // Name
+	fEvSlug      = "fldljDpbKuJ6y0Bys" // Slug (formula)
+	fEvStatus    = "fldP2oeMSijEs3FnR" // Status (single select)
+	fEvHCBID     = "fldsW0bQnkXwQVzZw" // HCB ID (org_xxx)
+	fEvEntitled  = "fldWsB6l9bmBFYtVY" // Entitled Autogrant Amount (formula, currency)
+	fEvDisbursed = "fldQ2lZHCQ5EEcZvk" // Disbursed Autogrant Amount (rollup of processed autogrants)
+	fEvOwed      = "fldEWH9DlsmNkgP6Z" // Owed Amount = entitled - disbursed
+
+	// Disbursements table
+	fDsID     = "fldRSkfLg8KsBlcnj" // ID (autonumber)
+	fDsEvent  = "fldq47aa1zX3jASW9" // Event (link)
+	fDsAmount = "fld5TDRXiG6LZ7hWW" // Amount (currency)
+	fDsStatus = "fldoj5OzDTb1sQDG5" // Status: Pending / Processed / Failed / Rejected
+	fDsType   = "fldx7nBEcHgmhhf5u" // Type: Autogrant / Miscellaneous / Loan / Withdrawal
+	fDsNotes  = "fld9j1H6LHaKPmjYm" // Notes
+
+	statusPending   = "Pending"
+	statusProcessed = "Processed"
+	statusFailed    = "Failed"
+
+	typeAutogrant     = "Autogrant"
+	typeWithdrawal    = "Withdrawal"
+	typeMiscellaneous = "Miscellaneous"
+)
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type Event struct {
+	RecordID  string
+	Name      string
+	Slug      string
+	Status    string
+	HCBID     string
+	Entitled  float64
+	Disbursed float64
+	Owed      float64
 }
 
-type HCBTransferRequest struct {
-	ToOrganizationID string `json:"to_organization_id"`
-	Name             string `json:"name"`
-	AmountCents      int    `json:"amount_cents"`
+type RunResult struct {
+	Event    string  `json:"event"`
+	HCBID    string  `json:"hcb_id"`
+	Amount   float64 `json:"amount"`
+	Type     string  `json:"type"`
+	Status   string  `json:"status"`
+	Note     string  `json:"note"`
+	RecordID string  `json:"disbursement_record"`
 }
 
 type DisbursementStats struct {
-	TotalEvents       int
-	EventsWithAmount  int
-	TotalAmountOwed   float64
+	Mode                 string
+	TotalEvents          int
+	EventsWithAmount     int
+	TotalAmount          float64
 	DisbursementsCreated int
-	ProcessedCount    int
-	FailedCount       int
-	LastRun           time.Time
+	ProcessedCount       int
+	FailedCount          int
+	LastRun              time.Time
+	Results              []RunResult
 }
 
-var stats DisbursementStats
+var (
+	stats    DisbursementStats
+	statsMu  sync.RWMutex
+	runMu    sync.Mutex // held for the whole duration of a payout run
+	httpCli  = &http.Client{Timeout: 45 * time.Second}
+	tsLayout = "2006-01-02 15:04:05 MST"
+)
 
-const dashboardHTML = `<!DOCTYPE html>
-<html>
-<head>
-    <title>Campfire Cash Cannon</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #1a1a2e; min-height: 100vh; }
-        .container { max-width: 860px; margin: 0 auto; padding: 32px 20px; }
-        h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
-        .subtitle { color: #666; font-size: 14px; margin-bottom: 28px; }
-        .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-        .card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #333; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; }
-        .stat { text-align: center; }
-        .stat .value { font-size: 28px; font-weight: 700; color: #007cba; }
-        .stat .label { font-size: 12px; color: #888; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .stat.success .value { color: #2e7d32; }
-        .stat.danger .value { color: #c62828; }
-        .actions { display: flex; gap: 12px; flex-wrap: wrap; }
-        .btn { padding: 12px 24px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; gap: 8px; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-primary { background: #007cba; color: #fff; }
-        .btn-primary:hover:not(:disabled) { background: #005f8f; }
-        .btn-danger { background: #c62828; color: #fff; }
-        .btn-danger:hover:not(:disabled) { background: #a51d1d; }
-        .btn-ghost { background: #e8e8e8; color: #333; }
-        .btn-ghost:hover:not(:disabled) { background: #d0d0d0; }
-        .custom-input { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-        .custom-input label { font-weight: 600; font-size: 14px; white-space: nowrap; }
-        .custom-input input { padding: 10px 14px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 15px; width: 160px; }
-        .custom-input input:focus { outline: none; border-color: #007cba; }
-        .divider { border-top: 1px solid #eee; margin: 20px 0; }
+func now() string { return time.Now().UTC().Format(tsLayout) }
 
-        /* Modal overlay */
-        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 100; justify-content: center; align-items: center; }
-        .modal-overlay.active { display: flex; }
-        .modal { background: #fff; border-radius: 14px; width: 90vw; max-width: 680px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.25); }
-        .modal-header { padding: 20px 24px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
-        .modal-header h2 { font-size: 18px; margin: 0; }
-        .modal-close { background: none; border: none; font-size: 22px; cursor: pointer; color: #888; padding: 4px 8px; border-radius: 6px; }
-        .modal-close:hover { background: #f0f0f0; }
-        .modal-body { padding: 20px 24px; overflow-y: auto; flex: 1; }
-        .modal-footer { padding: 16px 24px; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 10px; }
+// toCents converts a dollar amount to integer cents, rounding half away from
+// zero (Airtable currency fields can hold fractional cents, e.g. 1250.625).
+func toCents(amount float64) int {
+	return int(math.Round(amount * 100))
+}
 
-        /* Preview summary */
-        .preview-summary { background: #f8f9fa; border-radius: 10px; padding: 16px 20px; margin-bottom: 16px; display: flex; gap: 32px; flex-wrap: wrap; }
-        .preview-summary .item { }
-        .preview-summary .item .num { font-size: 22px; font-weight: 700; }
-        .preview-summary .item .lbl { font-size: 12px; color: #666; }
-        .preview-summary .item.total .num { color: #007cba; }
-        .preview-summary .item.warn .num { color: #c62828; }
-
-        /* Event table */
-        .event-table { width: 100%%; border-collapse: collapse; font-size: 13px; }
-        .event-table th { text-align: left; padding: 8px 12px; background: #f4f4f4; font-weight: 600; color: #555; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .event-table td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; }
-        .event-table tr:last-child td { border-bottom: none; }
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-        .badge-grant { background: #e8f5e9; color: #2e7d32; }
-        .badge-withdrawal { background: #fce4ec; color: #c62828; }
-        .amount-positive { color: #2e7d32; font-weight: 600; }
-        .amount-negative { color: #c62828; font-weight: 600; }
-
-        /* Spinner */
-        .spinner { display: inline-block; width: 18px; height: 18px; border: 2.5px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%%; animation: spin 0.6s linear infinite; }
-        .spinner.dark { border-color: rgba(0,0,0,0.1); border-top-color: #007cba; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-        /* Result banner */
-        .result-banner { padding: 16px 20px; border-radius: 10px; margin-bottom: 20px; display: none; }
-        .result-banner.success { background: #e8f5e9; color: #1b5e20; display: block; }
-        .result-banner.error { background: #fce4ec; color: #b71c1c; display: block; }
-        .result-banner h3 { font-size: 15px; margin-bottom: 4px; }
-        .result-banner p { font-size: 13px; margin: 2px 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>💸 Cash Cannon</h1>
-        <p class="subtitle">Campfire disbursement dashboard</p>
-
-        <div id="resultBanner" class="result-banner"></div>
-
-        <div class="card">
-            <h2>Last Run Statistics</h2>
-            <div class="stats-grid">
-                <div class="stat"><div class="value">%d</div><div class="label">Total Events</div></div>
-                <div class="stat"><div class="value">%d</div><div class="label">With Amount</div></div>
-                <div class="stat"><div class="value">$%.2f</div><div class="label">Total Owed</div></div>
-                <div class="stat"><div class="value">%d</div><div class="label">Disbursements</div></div>
-                <div class="stat success"><div class="value">%d</div><div class="label">Processed</div></div>
-                <div class="stat danger"><div class="value">%d</div><div class="label">Failed</div></div>
-            </div>
-            <p style="font-size:12px;color:#999;margin-top:12px;">Last run: %s</p>
-        </div>
-
-        <div class="card">
-            <h2>Autogrant Disbursements</h2>
-            <p style="font-size:13px;color:#666;margin-bottom:16px;">Disburse the <code>amount_owed</code> to each event. Only events with a non-zero balance will be processed.</p>
-            <div class="actions">
-                <button class="btn btn-primary" onclick="previewDisbursements('autogrant')">
-                    Preview &amp; Disburse
-                </button>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Custom Miscellaneous Disbursements</h2>
-            <p style="font-size:13px;color:#666;margin-bottom:16px;">Send a fixed dollar amount to every event in the view.</p>
-            <div class="custom-input">
-                <label for="customAmount">Amount per event ($)</label>
-                <input type="number" id="customAmount" step="0.01" min="0.01" placeholder="0.00">
-            </div>
-            <div class="actions">
-                <button class="btn btn-danger" onclick="previewDisbursements('custom')">
-                    Preview &amp; Disburse
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Confirmation Modal -->
-    <div class="modal-overlay" id="confirmModal">
-        <div class="modal">
-            <div class="modal-header">
-                <h2 id="modalTitle">Confirm Disbursements</h2>
-                <button class="modal-close" onclick="closeModal()">&times;</button>
-            </div>
-            <div class="modal-body" id="modalBody">
-                <div style="text-align:center;padding:40px;"><div class="spinner dark"></div><p style="margin-top:12px;color:#888;font-size:13px;">Loading preview…</p></div>
-            </div>
-            <div class="modal-footer" id="modalFooter" style="display:none;">
-                <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-                <button class="btn btn-danger" id="confirmBtn" onclick="executeDisbursements()">
-                    Confirm &amp; Send Money
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-    let currentMode = '';
-    let currentCustomAmount = 0;
-
-    function previewDisbursements(mode) {
-        currentMode = mode;
-        document.getElementById('confirmModal').classList.add('active');
-        document.getElementById('modalFooter').style.display = 'none';
-        document.getElementById('modalBody').innerHTML = '<div style="text-align:center;padding:40px;"><div class="spinner dark"></div><p style="margin-top:12px;color:#888;font-size:13px;">Fetching events from Airtable…</p></div>';
-
-        let url = '/api/preview';
-        if (mode === 'custom') {
-            const amt = document.getElementById('customAmount').value;
-            if (!amt || parseFloat(amt) <= 0) {
-                document.getElementById('modalBody').innerHTML = '<p style="color:#c62828;padding:20px;">Please enter a valid amount greater than zero.</p>';
-                return;
-            }
-            currentCustomAmount = parseFloat(amt);
-            url += '?custom_amount=' + encodeURIComponent(amt);
-            document.getElementById('modalTitle').textContent = 'Confirm Custom Disbursements';
-        } else {
-            document.getElementById('modalTitle').textContent = 'Confirm Autogrant Disbursements';
-        }
-
-        fetch(url)
-            .then(r => r.json())
-            .then(data => {
-                if (data.error) { throw new Error(data.error); }
-                renderPreview(data);
-            })
-            .catch(err => {
-                document.getElementById('modalBody').innerHTML = '<p style="color:#c62828;padding:20px;">Error: ' + err.message + '</p>';
-            });
-    }
-
-    function renderPreview(data) {
-        if (data.event_count === 0) {
-            document.getElementById('modalBody').innerHTML = '<p style="padding:20px;color:#666;">No events to process. All balances are zero.</p>';
-            return;
-        }
-
-        const totalAbs = data.events.reduce((s, e) => s + Math.abs(e.amount), 0);
-        const grants = data.events.filter(e => e.direction === 'grant');
-        const withdrawals = data.events.filter(e => e.direction === 'withdrawal');
-
-        let html = '<div class="preview-summary">';
-        html += '<div class="item"><div class="num">' + data.event_count + '</div><div class="lbl">Events</div></div>';
-        html += '<div class="item total"><div class="num">$' + totalAbs.toFixed(2) + '</div><div class="lbl">Total Amount</div></div>';
-        if (grants.length) html += '<div class="item"><div class="num">' + grants.length + '</div><div class="lbl">Grants</div></div>';
-        if (withdrawals.length) html += '<div class="item warn"><div class="num">' + withdrawals.length + '</div><div class="lbl">Withdrawals</div></div>';
-        html += '</div>';
-
-        html += '<table class="event-table"><thead><tr><th>HCB Event ID</th><th>Amount</th><th>Type</th></tr></thead><tbody>';
-        data.events.forEach(e => {
-            const amtClass = e.amount >= 0 ? 'amount-positive' : 'amount-negative';
-            const badge = e.direction === 'grant'
-                ? '<span class="badge badge-grant">Grant</span>'
-                : '<span class="badge badge-withdrawal">Withdrawal</span>';
-            html += '<tr><td>' + e.hcb_event_id + '</td><td class="' + amtClass + '">$' + Math.abs(e.amount).toFixed(2) + '</td><td>' + badge + '</td></tr>';
-        });
-        html += '</tbody></table>';
-
-        document.getElementById('modalBody').innerHTML = html;
-        document.getElementById('modalFooter').style.display = 'flex';
-    }
-
-    function executeDisbursements() {
-        const btn = document.getElementById('confirmBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<span class="spinner"></span> Processing…';
-
-        let url, body;
-        if (currentMode === 'custom') {
-            url = '/trigger-custom-disbursements';
-            body = 'custom_amount=' + encodeURIComponent(currentCustomAmount);
-        } else {
-            url = '/trigger-disbursements';
-            body = '';
-        }
-
-        fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: body
-        })
-        .then(r => r.json())
-        .then(result => {
-            closeModal();
-            showResult(result);
-        })
-        .catch(err => {
-            closeModal();
-            showResult({ error: err.message });
-        });
-    }
-
-    function showResult(result) {
-        const banner = document.getElementById('resultBanner');
-        if (result.error) {
-            banner.className = 'result-banner error';
-            banner.innerHTML = '<h3>Disbursement Failed</h3><p>' + result.error + '</p>';
-        } else {
-            banner.className = 'result-banner success';
-            banner.innerHTML = '<h3>Disbursements Complete</h3>'
-                + '<p>Created: ' + result.created + ' · Processed: ' + result.processed + ' · Failed: ' + result.failed + '</p>';
-        }
-        setTimeout(() => { location.reload(); }, 3000);
-    }
-
-    function closeModal() {
-        document.getElementById('confirmModal').classList.remove('active');
-        const btn = document.getElementById('confirmBtn');
-        btn.disabled = false;
-        btn.innerHTML = 'Confirm &amp; Send Money';
-    }
-    </script>
-</body>
-</html>`
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
+	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using environment variables")
 	}
+	loadConfig()
 
 	r := gin.Default()
+	r.GET("/healthz", func(c *gin.Context) { c.String(200, "ok") })
 
-	// Basic Auth middleware
-	authorized := r.Group("/", gin.BasicAuth(gin.Accounts{
-		os.Getenv("BASIC_AUTH_USERNAME"): os.Getenv("BASIC_AUTH_PASSWORD"),
-	}))
-
+	authorized := r.Group("/", gin.BasicAuth(gin.Accounts{cfg.BasicAuthUser: cfg.BasicAuthPass}))
 	authorized.GET("/", serveDashboard)
 	authorized.GET("/api/preview", handlePreview)
+	authorized.GET("/api/last-run", handleLastRun)
 	authorized.POST("/trigger-disbursements", triggerDisbursements)
 	authorized.POST("/trigger-custom-disbursements", triggerCustomDisbursements)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	log.Printf("%s cash cannon: paying from HCB org %q, Airtable base %s, listening on :%s",
+		cfg.ProgramName, cfg.HCBSourceOrg, cfg.AirtableBaseID, cfg.Port)
+	if err := r.Run(":" + cfg.Port); err != nil {
+		log.Fatal(err)
 	}
-
-	log.Printf("Starting server on port %s", port)
-	r.Run(":" + port)
 }
 
+var dashboardTmpl = template.Must(template.New("dash").Parse(dashboardHTML))
+
 func serveDashboard(c *gin.Context) {
+	statsMu.RLock()
+	s := stats
+	statsMu.RUnlock()
+
 	lastRun := "Never"
-	if !stats.LastRun.IsZero() {
-		lastRun = stats.LastRun.Format("2006-01-02 15:04:05 MST")
+	if !s.LastRun.IsZero() {
+		lastRun = s.LastRun.UTC().Format(tsLayout)
 	}
+	data := map[string]interface{}{
+		"Program":   cfg.ProgramName,
+		"SourceOrg": cfg.HCBSourceOrg,
+		"Stats":     s,
+		"LastRun":   lastRun,
+		"Running":   isRunning(),
+	}
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	if err := dashboardTmpl.Execute(c.Writer, data); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
 
-	html := fmt.Sprintf(dashboardHTML,
-		stats.TotalEvents,
-		stats.EventsWithAmount,
-		stats.TotalAmountOwed,
-		stats.DisbursementsCreated,
-		stats.ProcessedCount,
-		stats.FailedCount,
-		lastRun)
+func handleLastRun(c *gin.Context) {
+	statsMu.RLock()
+	defer statsMu.RUnlock()
+	c.JSON(200, stats)
+}
 
-	c.Header("Content-Type", "text/html")
-	c.String(200, html)
+func isRunning() bool {
+	if runMu.TryLock() {
+		runMu.Unlock()
+		return false
+	}
+	return true
+}
+
+type EventPreview struct {
+	RecordID  string  `json:"record_id"`
+	Name      string  `json:"name"`
+	HCBID     string  `json:"hcb_event_id"`
+	Entitled  float64 `json:"entitled"`
+	Disbursed float64 `json:"disbursed"`
+	Amount    float64 `json:"amount"`
+	Direction string  `json:"direction"`
+}
+
+func buildPlan(events []Event, customAmount float64, custom bool) ([]EventPreview, int, int) {
+	var previews []EventPreview
+	grantCents, withdrawCents := 0, 0
+	for _, ev := range events {
+		var amt float64
+		if custom {
+			amt = customAmount
+		} else {
+			amt = ev.Owed
+		}
+		if toCents(amt) == 0 {
+			continue
+		}
+		dir := "grant"
+		if amt < 0 {
+			dir = "withdrawal"
+			withdrawCents += -toCents(amt)
+		} else {
+			grantCents += toCents(amt)
+		}
+		previews = append(previews, EventPreview{
+			RecordID: ev.RecordID, Name: ev.Name, HCBID: ev.HCBID,
+			Entitled: ev.Entitled, Disbursed: ev.Disbursed, Amount: amt, Direction: dir,
+		})
+	}
+	return previews, grantCents, withdrawCents
 }
 
 func handlePreview(c *gin.Context) {
-	customAmountStr := c.Query("custom_amount")
+	custom := false
+	customAmount := 0.0
+	if s := c.Query("custom_amount"); s != "" {
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil || v <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid custom amount"})
+			return
+		}
+		custom, customAmount = true, v
+	}
 
 	events, err := getAllEvents()
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("Failed to fetch events: %v", err)})
 		return
 	}
+	previews, grantCents, withdrawCents := buildPlan(events, customAmount, custom)
 
-	type EventPreview struct {
-		RecordID   string  `json:"record_id"`
-		HCBEventID string  `json:"hcb_event_id"`
-		Amount     float64 `json:"amount"`
-		Direction  string  `json:"direction"`
+	balanceCents, balErr := getHCBBalance(cfg.HCBSourceOrg)
+	resp := gin.H{
+		"events":            previews,
+		"total_events":      len(events),
+		"event_count":       len(previews),
+		"total_grants":      float64(grantCents) / 100,
+		"total_withdrawals": float64(withdrawCents) / 100,
+		"source_org":        cfg.HCBSourceOrg,
+		"running":           isRunning(),
 	}
-
-	var previews []EventPreview
-	totalAmount := 0.0
-
-	if customAmountStr != "" {
-		customAmount, err := strconv.ParseFloat(customAmountStr, 64)
-		if err != nil {
-			c.JSON(400, gin.H{"error": "Invalid custom amount"})
-			return
-		}
-		for _, event := range events {
-			previews = append(previews, EventPreview{
-				RecordID:   event.ID,
-				HCBEventID: event.Fields.HCBEventID,
-				Amount:     customAmount,
-				Direction:  "grant",
-			})
-			totalAmount += customAmount
-		}
+	if balErr != nil {
+		resp["balance_error"] = balErr.Error()
 	} else {
-		for _, event := range events {
-			if event.Fields.AmountOwed != 0 {
-				direction := "grant"
-				if event.Fields.AmountOwed < 0 {
-					direction = "withdrawal"
-				}
-				previews = append(previews, EventPreview{
-					RecordID:   event.ID,
-					HCBEventID: event.Fields.HCBEventID,
-					Amount:     event.Fields.AmountOwed,
-					Direction:  direction,
-				})
-				totalAmount += event.Fields.AmountOwed
-			}
-		}
+		resp["source_balance"] = float64(balanceCents) / 100
+		resp["sufficient_funds"] = balanceCents >= grantCents
 	}
-
-	c.JSON(200, gin.H{
-		"events":       previews,
-		"total_events": len(events),
-		"total_amount": totalAmount,
-		"event_count":  len(previews),
-	})
+	if previews == nil {
+		resp["events"] = []EventPreview{}
+	}
+	c.JSON(200, resp)
 }
 
 func triggerDisbursements(c *gin.Context) {
-	log.Println("Starting disbursement process...")
-	
-	stats = DisbursementStats{}
-	stats.LastRun = time.Now()
-	
-	// Get all events from Airtable
-	events, err := getAllEvents()
-	if err != nil {
-		log.Printf("Error fetching events: %v", err)
-		c.String(500, "Error fetching events: %v", err)
-		return
-	}
-
-	stats.TotalEvents = len(events)
-	log.Printf("Found %d total events", len(events))
-
-	var processedEvents []AirtableEvent
-	for _, event := range events {
-		if event.Fields.AmountOwed > 0 {
-			processedEvents = append(processedEvents, event)
-			stats.TotalAmountOwed += event.Fields.AmountOwed
-		}
-	}
-
-	stats.EventsWithAmount = len(processedEvents)
-	log.Printf("Found %d events with amount owed > 0, total amount: $%.2f", len(processedEvents), stats.TotalAmountOwed)
-
-	// Process each event including negative amounts
-	for _, event := range events {
-		if event.Fields.AmountOwed != 0 { // Process both positive and negative amounts
-			err := processDisbursement(event)
-			if err != nil {
-				log.Printf("Error processing disbursement for event %s: %v", event.ID, err)
-				stats.FailedCount++
-			} else {
-				stats.ProcessedCount++
-			}
-			stats.DisbursementsCreated++
-		}
-	}
-
-	log.Printf("Disbursement process completed. Created: %d, Processed: %d, Failed: %d", 
-		stats.DisbursementsCreated, stats.ProcessedCount, stats.FailedCount)
-
-	c.JSON(200, gin.H{
-		"created":   stats.DisbursementsCreated,
-		"processed": stats.ProcessedCount,
-		"failed":    stats.FailedCount,
-	})
+	runPayout(c, false, 0)
 }
 
 func triggerCustomDisbursements(c *gin.Context) {
-	log.Println("Starting custom disbursement process...")
-	
-	customAmountStr := c.PostForm("custom_amount")
-	if customAmountStr == "" {
-		c.String(400, "Custom amount is required")
+	amountStr := c.PostForm("custom_amount")
+	amount, err := strconv.ParseFloat(amountStr, 64)
+	if err != nil || amount <= 0 {
+		c.JSON(400, gin.H{"error": "custom_amount must be a positive number"})
 		return
 	}
-	
-	var customAmount float64
-	_, err := fmt.Sscanf(customAmountStr, "%f", &customAmount)
-	if err != nil {
-		c.String(400, "Invalid amount format: %v", err)
+	runPayout(c, true, amount)
+}
+
+// runPayout is the single entry point for moving money. Only one run may be in
+// flight at a time; a second request while one is running gets a 409.
+func runPayout(c *gin.Context, custom bool, customAmount float64) {
+	if !runMu.TryLock() {
+		c.JSON(409, gin.H{"error": "A disbursement run is already in progress. Wait for it to finish and refresh."})
 		return
 	}
-	
-	// Get all events from Airtable
+	defer runMu.Unlock()
+
+	mode := "autogrant"
+	if custom {
+		mode = fmt.Sprintf("custom $%.2f", customAmount)
+	}
+	log.Printf("=== starting %s disbursement run ===", mode)
+
 	events, err := getAllEvents()
 	if err != nil {
-		log.Printf("Error fetching events: %v", err)
-		c.String(500, "Error fetching events: %v", err)
+		log.Printf("error fetching events: %v", err)
+		c.JSON(500, gin.H{"error": fmt.Sprintf("Error fetching events: %v", err)})
 		return
 	}
-	
-	log.Printf("Found %d events for custom disbursement of $%.2f each", len(events), customAmount)
-	
-	processedCount := 0
-	failedCount := 0
-	
-	// Process each event with custom amount
-	for _, event := range events {
-		err := processCustomDisbursement(event, customAmount)
-		if err != nil {
-			log.Printf("Error processing custom disbursement for event %s: %v", event.ID, err)
-			failedCount++
-		} else {
-			processedCount++
-		}
-	}
-	
-	log.Printf("Custom disbursement process completed. Processed: %d, Failed: %d", processedCount, failedCount)
+	plan, grantCents, withdrawCents := buildPlan(events, customAmount, custom)
+	log.Printf("found %d eligible events, %d to pay: grants $%.2f, withdrawals $%.2f",
+		len(events), len(plan), float64(grantCents)/100, float64(withdrawCents)/100)
 
+	// Pre-flight: refuse to start a run the source org cannot fund. Partial runs
+	// leave a trail of Failed rows and are confusing to reconcile.
+	balanceCents, err := getHCBBalance(cfg.HCBSourceOrg)
+	if err != nil {
+		c.JSON(502, gin.H{"error": fmt.Sprintf("Could not read HCB balance for %s: %v", cfg.HCBSourceOrg, err)})
+		return
+	}
+	if grantCents > balanceCents {
+		msg := fmt.Sprintf("Insufficient funds: %s holds $%.2f but $%.2f is needed for grants. Top up HCB and retry.",
+			cfg.HCBSourceOrg, float64(balanceCents)/100, float64(grantCents)/100)
+		log.Println(msg)
+		c.JSON(409, gin.H{"error": msg})
+		return
+	}
+
+	s := DisbursementStats{Mode: mode, LastRun: time.Now(), TotalEvents: len(events), EventsWithAmount: len(plan),
+		TotalAmount: float64(grantCents-withdrawCents) / 100}
+	byID := map[string]Event{}
+	for _, ev := range events {
+		byID[ev.RecordID] = ev
+	}
+
+	for _, p := range plan {
+		ev := byID[p.RecordID]
+		dtype := typeAutogrant
+		if custom {
+			dtype = typeMiscellaneous
+		} else if p.Amount < 0 {
+			dtype = typeWithdrawal
+		}
+		res := processDisbursement(ev, p.Amount, dtype)
+		s.DisbursementsCreated++
+		if res.Status == statusProcessed {
+			s.ProcessedCount++
+		} else {
+			s.FailedCount++
+		}
+		s.Results = append(s.Results, res)
+	}
+
+	statsMu.Lock()
+	stats = s
+	statsMu.Unlock()
+
+	log.Printf("=== run complete: created %d, processed %d, failed %d ===", s.DisbursementsCreated, s.ProcessedCount, s.FailedCount)
 	c.JSON(200, gin.H{
-		"created":   processedCount + failedCount,
-		"processed": processedCount,
-		"failed":    failedCount,
+		"created":   s.DisbursementsCreated,
+		"processed": s.ProcessedCount,
+		"failed":    s.FailedCount,
+		"results":   s.Results,
 	})
 }
 
-func getAllEvents() ([]AirtableEvent, error) {
-	var allEvents []AirtableEvent
-	offset := ""
+// processDisbursement creates the Airtable row first (so there is always a
+// record of the attempt), then moves the money, then marks the row.
+func processDisbursement(ev Event, amount float64, dtype string) RunResult {
+	res := RunResult{Event: ev.Name, HCBID: ev.HCBID, Amount: amount, Type: dtype}
+	log.Printf("processing %s for %s (%s): $%.2f", dtype, ev.Name, ev.HCBID, amount)
 
-	for {
-		events, nextOffset, err := getEventsPage(offset)
+	createNote := fmt.Sprintf("[%s] Created by cash cannon. Event: %s (%s), HCB org: %s, type: %s, amount: $%.2f.\n"+
+		"Snapshot at creation: entitled $%.2f, disbursed $%.2f, owed $%.2f.",
+		now(), ev.Name, ev.RecordID, ev.HCBID, dtype, amount, ev.Entitled, ev.Disbursed, ev.Owed)
+	recID, seq, err := createDisbursement(ev.RecordID, amount, dtype, createNote)
+	if err != nil {
+		res.Status = statusFailed
+		res.Note = fmt.Sprintf("could not create Airtable disbursement row: %v", err)
+		log.Printf("  %s", res.Note)
+		return res
+	}
+	res.RecordID = recID
+	log.Printf("  created disbursement #%d (%s)", seq, recID)
+
+	hcbResp, err := sendHCBTransfer(ev, seq, amount, dtype)
+	if err != nil {
+		res.Status = statusFailed
+		res.Note = fmt.Sprintf("HCB transfer failed: %v", err)
+		note := createNote + fmt.Sprintf("\n[%s] HCB transfer FAILED: %v", now(), err)
+		if uerr := updateDisbursement(recID, statusFailed, note); uerr != nil {
+			log.Printf("  could not mark row failed: %v", uerr)
+			res.Note += fmt.Sprintf(" (and could not update Airtable row: %v)", uerr)
+		}
+		log.Printf("  %s", res.Note)
+		return res
+	}
+
+	var done string
+	if amount < 0 {
+		done = fmt.Sprintf("[%s] HCB transfer SUCCEEDED: pulled $%.2f from %s into %s. HCB response: %s",
+			now(), -amount, ev.HCBID, cfg.HCBSourceOrg, hcbResp)
+	} else {
+		done = fmt.Sprintf("[%s] HCB transfer SUCCEEDED: sent $%.2f from %s to %s. HCB response: %s",
+			now(), amount, cfg.HCBSourceOrg, ev.HCBID, hcbResp)
+	}
+	if err := updateDisbursement(recID, statusProcessed, createNote+"\n"+done); err != nil {
+		// Money moved but the row is still Pending: the rollup will not count it
+		// and a re-run would pay again. Make this loud.
+		res.Status = statusFailed
+		res.Note = fmt.Sprintf("MONEY MOVED but Airtable row %s could not be marked Processed: %v. Fix the row by hand before re-running.", recID, err)
+		log.Printf("  %s", res.Note)
+		return res
+	}
+	res.Status = statusProcessed
+	res.Note = done
+	log.Printf("  disbursement #%d processed", seq)
+	return res
+}
+
+// ---------------------------------------------------------------------------
+// Airtable
+// ---------------------------------------------------------------------------
+
+func airtableURL(table string) string {
+	return fmt.Sprintf("https://api.airtable.com/v0/%s/%s", cfg.AirtableBaseID, table)
+}
+
+func airtableDo(method, rawURL string, body interface{}) ([]byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-
-		allEvents = append(allEvents, events...)
-
-		if nextOffset == "" {
-			break
-		}
-		offset = nextOffset
+		rdr = bytes.NewReader(b)
 	}
-
-	return allEvents, nil
-}
-
-func getEventsPage(offset string) ([]AirtableEvent, string, error) {
-	baseID := os.Getenv("AIRTABLE_BASE_ID")
-	apiKey := os.Getenv("AIRTABLE_API_KEY")
-	viewID := "viwjvoyfA2Cgc4XE4"
-
-	url := fmt.Sprintf("https://api.airtable.com/v0/%s/events?view=%s", baseID, viewID)
-	if offset != "" {
-		url += "&offset=" + offset
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(method, rawURL, rdr)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.AirtableAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, "", fmt.Errorf("airtable API error: %s", string(body))
-	}
-
-	var response AirtableEventsResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, "", err
-	}
-
-	return response.Records, response.Offset, nil
-}
-
-func processDisbursement(event AirtableEvent) error {
-	log.Printf("Processing disbursement for event %s (HCB ID: %s, Amount: $%.2f)", 
-		event.ID, event.Fields.HCBEventID, event.Fields.AmountOwed)
-
-	// Create disbursement in Airtable
-	disbursement, err := createDisbursement(event)
-	if err != nil {
-		return fmt.Errorf("failed to create disbursement: %v", err)
-	}
-
-	log.Printf("Created disbursement %d for event %s", 
-		disbursement.Fields.DisbursementID, event.ID)
-
-	// Send to HCB
-	err = sendHCBTransfer(event, disbursement.Fields.DisbursementID)
-	if err != nil {
-		// Update disbursement as failed
-		notes := fmt.Sprintf("HCB transfer failed: %v. Created at %s", err, time.Now().Format("2006-01-02 15:04:05 MST"))
-		updateErr := updateDisbursementStatus(disbursement.ID, "failed", notes)
-		if updateErr != nil {
-			log.Printf("Failed to update disbursement status: %v", updateErr)
+	// Airtable rate-limits at 5 req/s per base; retry once on 429.
+	for attempt := 0; ; attempt++ {
+		resp, err := httpCli.Do(req)
+		if err != nil {
+			return nil, err
 		}
-		return fmt.Errorf("HCB transfer failed: %v", err)
-	}
-
-	// Update disbursement as processed
-	var notes string
-	if event.Fields.AmountOwed < 0 {
-		notes = fmt.Sprintf("Successfully processed HCB withdrawal. Received $%.2f from organization %s. Completed at %s", 
-			-event.Fields.AmountOwed, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
-	} else {
-		notes = fmt.Sprintf("Successfully processed HCB transfer. Sent $%.2f to organization %s. Completed at %s", 
-			event.Fields.AmountOwed, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
-	}
-	err = updateDisbursementStatus(disbursement.ID, "processed", notes)
-	if err != nil {
-		log.Printf("Failed to update disbursement status: %v", err)
-		return err
-	}
-
-	log.Printf("Successfully completed disbursement %d", disbursement.Fields.DisbursementID)
-	return nil
-}
-
-func createDisbursement(event AirtableEvent) (*AirtableDisbursementResponse, error) {
-	baseID := os.Getenv("AIRTABLE_BASE_ID")
-	apiKey := os.Getenv("AIRTABLE_API_KEY")
-
-	disbursementType := "autogrant"
-	if event.Fields.AmountOwed < 0 {
-		disbursementType = "withdrawal"
-	}
-
-	disbursement := AirtableDisbursement{
-		Fields: struct {
-			AssociatedEvent   []string `json:"associated_event"`
-			Amount            float64  `json:"amount"`
-			Status            string   `json:"status"`
-			DisbursementType  string   `json:"disbursement_type"`
-			Notes             string   `json:"notes"`
-		}{
-			AssociatedEvent:  []string{event.ID},
-			Amount:           event.Fields.AmountOwed,
-			Status:           "pending",
-			DisbursementType: disbursementType,
-			Notes:            fmt.Sprintf("Created for event %s at %s", event.ID, time.Now().Format("2006-01-02 15:04:05 MST")),
-		},
-	}
-
-	jsonData, err := json.Marshal(disbursement)
-	if err != nil {
-		return nil, err
-	}
-
-	url := fmt.Sprintf("https://api.airtable.com/v0/%s/disbursements", baseID)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("airtable API error: %s", string(body))
-	}
-
-	var response AirtableDisbursementResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &response, nil
-}
-
-func sendHCBTransfer(event AirtableEvent, disbursementID int) error {
-	token := os.Getenv("HCB_API_TOKEN")
-
-	var transfer HCBTransferRequest
-	var url string
-
-	if event.Fields.AmountOwed < 0 {
-		// Negative amount - withdrawal from event to Campfire
-		transfer = HCBTransferRequest{
-			ToOrganizationID: "campfire",
-			Name:             fmt.Sprintf("Campfire signup withdrawal ID %d", disbursementID),
-			AmountCents:      int(-event.Fields.AmountOwed * 100), // Make positive for transfer amount
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
 		}
-		url = fmt.Sprintf("https://hcb.hackclub.com/api/v4/organizations/%s/transfers/", event.Fields.HCBEventID)
-	} else {
-		// Positive amount - grant from Campfire to event
-		transfer = HCBTransferRequest{
-			ToOrganizationID: event.Fields.HCBEventID,
-			Name:             fmt.Sprintf("Campfire signup grant ID %d", disbursementID),
-			AmountCents:      int(event.Fields.AmountOwed * 100), // Convert to cents
+		if resp.StatusCode == 429 && attempt < 3 {
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			if rdr != nil {
+				b, _ := json.Marshal(body)
+				req.Body = io.NopCloser(bytes.NewReader(b))
+			}
+			continue
 		}
-		url = "https://hcb.hackclub.com/api/v4/organizations/campfire/transfers/"
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("airtable %s %s -> %d: %s", method, rawURL, resp.StatusCode, truncate(string(data), 500))
+		}
+		return data, nil
 	}
-
-	jsonData, err := json.Marshal(transfer)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HCB API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	log.Printf("HCB transfer successful: %s", string(body))
-	return nil
 }
 
-func updateDisbursementStatus(disbursementID, status, notes string) error {
-	baseID := os.Getenv("AIRTABLE_BASE_ID")
-	apiKey := os.Getenv("AIRTABLE_API_KEY")
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
 
-	update := map[string]interface{}{
+type airtableRecord struct {
+	ID     string                 `json:"id"`
+	Fields map[string]interface{} `json:"fields"`
+}
+
+func num(v interface{}) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case string:
+		f, _ := strconv.ParseFloat(t, 64)
+		return f
+	}
+	return 0
+}
+
+func str(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func getAllEvents() ([]Event, error) {
+	var all []Event
+	offset := ""
+	for {
+		q := url.Values{}
+		q.Set("filterByFormula", cfg.EventsFilter)
+		q.Set("returnFieldsByFieldId", "true")
+		q.Set("pageSize", "100")
+		for _, f := range []string{fEvName, fEvSlug, fEvStatus, fEvHCBID, fEvEntitled, fEvDisbursed, fEvOwed} {
+			q.Add("fields[]", f)
+		}
+		if offset != "" {
+			q.Set("offset", offset)
+		}
+		data, err := airtableDo("GET", airtableURL(cfg.EventsTable)+"?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Records []airtableRecord `json:"records"`
+			Offset  string           `json:"offset"`
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, err
+		}
+		for _, r := range page.Records {
+			all = append(all, Event{
+				RecordID:  r.ID,
+				Name:      str(r.Fields[fEvName]),
+				Slug:      str(r.Fields[fEvSlug]),
+				Status:    str(r.Fields[fEvStatus]),
+				HCBID:     strings.TrimSpace(str(r.Fields[fEvHCBID])),
+				Entitled:  num(r.Fields[fEvEntitled]),
+				Disbursed: num(r.Fields[fEvDisbursed]),
+				Owed:      num(r.Fields[fEvOwed]),
+			})
+		}
+		if page.Offset == "" {
+			return all, nil
+		}
+		offset = page.Offset
+	}
+}
+
+func createDisbursement(eventRecordID string, amount float64, dtype, notes string) (recID string, seq int, err error) {
+	body := map[string]interface{}{
+		"returnFieldsByFieldId": true,
 		"fields": map[string]interface{}{
-			"status": status,
-			"notes":  notes,
+			fDsEvent:  []string{eventRecordID},
+			fDsAmount: amount,
+			fDsStatus: statusPending,
+			fDsType:   dtype,
+			fDsNotes:  notes,
 		},
 	}
-
-	jsonData, err := json.Marshal(update)
+	data, err := airtableDo("POST", airtableURL(cfg.DisbursementsTable), body)
 	if err != nil {
-		return err
+		return "", 0, err
 	}
-
-	url := fmt.Sprintf("https://api.airtable.com/v0/%s/disbursements/%s", baseID, disbursementID)
-	req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
+	var rec airtableRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return "", 0, err
 	}
-
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("airtable API error updating disbursement: %s", string(body))
-	}
-
-	return nil
+	return rec.ID, int(num(rec.Fields[fDsID])), nil
 }
 
-func processCustomDisbursement(event AirtableEvent, customAmount float64) error {
-	log.Printf("Processing custom disbursement for event %s (HCB ID: %s, Custom Amount: $%.2f)", 
-		event.ID, event.Fields.HCBEventID, customAmount)
-
-	// Create disbursement in Airtable with custom amount
-	disbursement, err := createCustomDisbursement(event, customAmount)
-	if err != nil {
-		return fmt.Errorf("failed to create custom disbursement: %v", err)
+func updateDisbursement(recID, status, notes string) error {
+	body := map[string]interface{}{
+		"fields": map[string]interface{}{fDsStatus: status, fDsNotes: notes},
 	}
+	_, err := airtableDo("PATCH", airtableURL(cfg.DisbursementsTable)+"/"+recID, body)
+	return err
+}
 
-	log.Printf("Created custom disbursement %d for event %s", 
-		disbursement.Fields.DisbursementID, event.ID)
+// ---------------------------------------------------------------------------
+// HCB
+// ---------------------------------------------------------------------------
 
-	// Send to HCB with custom amount
-	err = sendCustomHCBTransfer(event, disbursement.Fields.DisbursementID, customAmount)
-	if err != nil {
-		// Update disbursement as failed
-		notes := fmt.Sprintf("HCB custom transfer failed: %v. Created at %s", err, time.Now().Format("2006-01-02 15:04:05 MST"))
-		updateErr := updateDisbursementStatus(disbursement.ID, "failed", notes)
-		if updateErr != nil {
-			log.Printf("Failed to update disbursement status: %v", updateErr)
+func hcbDo(method, path string, body interface{}) (int, []byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
 		}
-		return fmt.Errorf("HCB custom transfer failed: %v", err)
+		rdr = bytes.NewReader(b)
 	}
-
-	// Update disbursement as processed
-	notes := fmt.Sprintf("Successfully processed custom HCB transfer. Sent $%.2f to organization %s. Completed at %s", 
-		customAmount, event.Fields.HCBEventID, time.Now().Format("2006-01-02 15:04:05 MST"))
-	err = updateDisbursementStatus(disbursement.ID, "processed", notes)
+	req, err := http.NewRequest(method, "https://hcb.hackclub.com/api/v4"+path, rdr)
 	if err != nil {
-		log.Printf("Failed to update disbursement status: %v", err)
-		return err
+		return 0, nil, err
 	}
-
-	log.Printf("Successfully completed custom disbursement %d", disbursement.Fields.DisbursementID)
-	return nil
-}
-
-func createCustomDisbursement(event AirtableEvent, customAmount float64) (*AirtableDisbursementResponse, error) {
-	baseID := os.Getenv("AIRTABLE_BASE_ID")
-	apiKey := os.Getenv("AIRTABLE_API_KEY")
-
-	disbursement := AirtableDisbursement{
-		Fields: struct {
-			AssociatedEvent   []string `json:"associated_event"`
-			Amount            float64  `json:"amount"`
-			Status            string   `json:"status"`
-			DisbursementType  string   `json:"disbursement_type"`
-			Notes             string   `json:"notes"`
-		}{
-			AssociatedEvent:  []string{event.ID},
-			Amount:           customAmount,
-			Status:           "pending",
-			DisbursementType: "miscellaneous",
-			Notes:            fmt.Sprintf("Custom disbursement created for event %s at %s", event.ID, time.Now().Format("2006-01-02 15:04:05 MST")),
-		},
-	}
-
-	jsonData, err := json.Marshal(disbursement)
-	if err != nil {
-		return nil, err
-	}
-
-	url := fmt.Sprintf("https://api.airtable.com/v0/%s/disbursements", baseID)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.HCBToken)
 	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpCli.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("airtable API error: %s", string(body))
-	}
-
-	var response AirtableDisbursementResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &response, nil
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
 }
 
-func sendCustomHCBTransfer(event AirtableEvent, disbursementID int, customAmount float64) error {
-	token := os.Getenv("HCB_API_TOKEN")
-
-	transfer := HCBTransferRequest{
-		ToOrganizationID: event.Fields.HCBEventID,
-		Name:             fmt.Sprintf("Campfire miscellaneous disbursement %d", disbursementID),
-		AmountCents:      int(customAmount * 100), // Convert to cents
-	}
-	url := "https://hcb.hackclub.com/api/v4/organizations/campfire/transfers/"
-
-	jsonData, err := json.Marshal(transfer)
+func getHCBBalance(org string) (int, error) {
+	code, data, err := hcbDo("GET", "/organizations/"+org, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	if code != 200 {
+		return 0, fmt.Errorf("HCB %d: %s", code, truncate(string(data), 300))
+	}
+	var o struct {
+		BalanceCents *int `json:"balance_cents"`
+	}
+	if err := json.Unmarshal(data, &o); err != nil {
+		return 0, err
+	}
+	if o.BalanceCents == nil {
+		return 0, fmt.Errorf("HCB did not return balance_cents for %s (token may lack access)", org)
+	}
+	return *o.BalanceCents, nil
+}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+type hcbTransferRequest struct {
+	ToOrganizationID string `json:"to_organization_id"`
+	Name             string `json:"name"`
+	AmountCents      int    `json:"amount_cents"`
+}
+
+// sendHCBTransfer moves money. Positive amounts go source -> event; negative
+// amounts are pulled event -> source (the token must be able to transfer out
+// of the event org for that to succeed).
+func sendHCBTransfer(ev Event, seq int, amount float64, dtype string) (string, error) {
+	var from string
+	var body hcbTransferRequest
+	switch {
+	case amount < 0:
+		from = ev.HCBID
+		body = hcbTransferRequest{ToOrganizationID: cfg.HCBSourceOrg,
+			Name: fmt.Sprintf("%s signup withdrawal #%d", cfg.ProgramName, seq), AmountCents: -toCents(amount)}
+	case dtype == typeMiscellaneous:
+		from = cfg.HCBSourceOrg
+		body = hcbTransferRequest{ToOrganizationID: ev.HCBID,
+			Name: fmt.Sprintf("%s miscellaneous disbursement #%d", cfg.ProgramName, seq), AmountCents: toCents(amount)}
+	default:
+		from = cfg.HCBSourceOrg
+		body = hcbTransferRequest{ToOrganizationID: ev.HCBID,
+			Name: fmt.Sprintf("%s signup grant #%d", cfg.ProgramName, seq), AmountCents: toCents(amount)}
+	}
+	if body.AmountCents <= 0 {
+		return "", fmt.Errorf("refusing zero-cent transfer")
+	}
+	code, data, err := hcbDo("POST", "/organizations/"+from+"/transfers", body)
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+	if code < 200 || code >= 300 {
+		return "", fmt.Errorf("HCB API error (status %d): %s", code, truncate(string(data), 500))
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HCB API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	log.Printf("HCB custom transfer successful: %s", string(body))
-	return nil
+	log.Printf("  HCB transfer ok (%d): %s", code, truncate(string(data), 300))
+	return truncate(string(data), 1500), nil
 }
