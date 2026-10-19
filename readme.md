@@ -2,8 +2,7 @@
 
 A small Go service that pays Haven events their signup autogrants through the
 [HCB v4 API](https://hcb.hackclub.com/docs/api/v4), driven by the Haven Airtable
-base. Adapted from the Campfire cash cannon (`main` branch); this is the `haven`
-branch.
+base. Adapted from the Campfire cash cannon (see git history before commit 8d1dc8b).
 
 ## How it works
 
